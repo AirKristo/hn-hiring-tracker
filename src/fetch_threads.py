@@ -13,6 +13,7 @@ import time
 
 import pandas as pd
 import requests
+import re
 
 ALGOLIA_SEARCH_URL = "https://hn.algolia.com/api/v1/search_by_date"
 HITS_PER_PAGE = 1000
@@ -50,22 +51,50 @@ def fetch_whoishiring_submissions():
 
     return all_hits
 
+# Matches the monthly cadence: "Ask HN: Who is hiring? (April 2011)".
+# Requiring the (Month Year) suffix excludes one-off threads such as the
+# 2020 "Who is hiring right now?" post and the 2011 meta thread.
+HIRING_THREAD_PATTERN = re.compile(
+    r"who is hiring\?\s*\((\w+)\s+(\d{4})\)",
+    re.IGNORECASE,
+)
 
-def is_hiring_thread(title):
-    """True for 'Who is hiring?' threads, false for the other monthly threads."""
+# A thread with very few comments is almost certainly broken or superseded
+# rather than a genuinely quiet month. December 2011 has 4 comments against
+# roughly 290 in neighboring months.
+MIN_PLAUSIBLE_COMMENTS = 50
+
+
+def parse_month_and_year_from_title(title):
+    """Return (month_number, year) from the thread title, or None if it doesn't match."""
     if title is None:
-        return False
+        return None
 
-    lowercase_title = title.lower()
-    return "who is hiring" in lowercase_title
+    match = HIRING_THREAD_PATTERN.search(title)
+    if match is None:
+        return None
+
+    month_name = match.group(1)
+    year = int(match.group(2))
+
+    try:
+        month_number = pd.to_datetime(month_name, format="%B").month
+    except ValueError:
+        return None
+
+    return month_number, year
 
 
 def build_threads_dataframe(hits):
     rows = []
 
     for hit in hits:
-        if not is_hiring_thread(hit.get("title")):
+        parsed = parse_month_and_year_from_title(hit.get("title"))
+
+        if parsed is None:
             continue
+
+        month_number, year = parsed
 
         rows.append({
             "thread_id": hit["objectID"],
@@ -73,25 +102,58 @@ def build_threads_dataframe(hits):
             "created_at": hit["created_at"],
             "num_comments": hit.get("num_comments"),
             "points": hit.get("points"),
+            "year": year,
+            "month": month_number,
         })
 
     threads = pd.DataFrame(rows)
-    threads["created_at"] = pd.to_datetime(threads["created_at"])
-    threads = threads.sort_values("created_at").reset_index(drop=True)
-    threads["year"] = threads["created_at"].dt.year
-    threads["month"] = threads["created_at"].dt.month
+    threads["created_at"] = pd.to_datetime(threads["created_at"]).dt.tz_localize(None)
+    threads = threads.sort_values(["year", "month"]).reset_index(drop=True)
 
     return threads
 
 
-def report_missing_months(threads):
-    """Flag any calendar months with no hiring thread, so gaps are known up front."""
-    first_month = threads["created_at"].min().to_period("M")
-    last_month = threads["created_at"].max().to_period("M")
+def report_duplicate_months(threads):
+    """Each month should appear exactly once."""
+    counts_per_month = threads.groupby(["year", "month"]).size()
+    duplicated_months = counts_per_month[counts_per_month > 1]
 
-    expected_months = pd.period_range(first_month, last_month, freq="M")
-    observed_months = threads["created_at"].dt.to_period("M")
+    if len(duplicated_months) == 0:
+        print("No duplicate months.")
+    else:
+        print(f"Duplicate months found:\n{duplicated_months}")
+
+
+def report_suspect_threads(threads):
+    """Flag threads too small to be a real month of postings."""
+    suspect_threads = threads[threads["num_comments"] < MIN_PLAUSIBLE_COMMENTS]
+
+    if len(suspect_threads) == 0:
+        print("No suspiciously small threads.")
+    else:
+        print(f"Suspiciously small threads ({len(suspect_threads)}):")
+        for _, row in suspect_threads.iterrows():
+            print(f"  {row['year']}-{row['month']:02d} "
+                  f"id={row['thread_id']} comments={row['num_comments']}")
+
+
+def report_missing_months(threads):
+    """Flag calendar months with no hiring thread, so gaps are known up front."""
+    observed_months = pd.PeriodIndex.from_fields(
+        year=threads["year"],
+        month=threads["month"],
+        freq="M",
+    )
+
+    expected_months = pd.period_range(
+        observed_months.min(),
+        observed_months.max(),
+        freq="M",
+    )
     missing_months = expected_months.difference(observed_months)
+
+    print(f"Expected months in range: {len(expected_months)}")
+    print(f"Observed months: {len(observed_months)}")
 
     if len(missing_months) == 0:
         print("No missing months.")
@@ -105,12 +167,15 @@ def main():
 
     threads = build_threads_dataframe(hits)
 
-    print(f"Who is hiring threads: {len(threads)}")
+    print(f"Monthly hiring threads: {len(threads)}")
     print(f"Date range: {threads['created_at'].min().date()} "
           f"to {threads['created_at'].max().date()}")
     print(f"Total comments across all threads: {threads['num_comments'].sum():,.0f}")
+    print()
 
     report_missing_months(threads)
+    report_duplicate_months(threads)
+    report_suspect_threads(threads)
 
     threads.to_csv(OUTPUT_PATH, index=False)
     print(f"\nSaved to {OUTPUT_PATH}")
