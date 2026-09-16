@@ -29,6 +29,7 @@ Contact details are redacted before anything is written to data/processed/.
 import json
 import os
 import re
+from locations import extract_location_flags
 
 import pandas as pd
 
@@ -305,7 +306,7 @@ def build_postings(threads):
             mentions_remote, mentions_onsite, is_hybrid, is_worldwide_remote = \
                 extract_remote_flags(header)
 
-            rows.append({
+            posting = {
                 "comment_id": comment["objectID"],
                 "thread_id": thread_id,
                 "year": thread["year"],
@@ -319,8 +320,13 @@ def build_postings(threads):
                 "salary_low": salary_low,
                 "salary_high": salary_high,
                 "salary_currency": currency,
-                "had_contact_info": contains_contact_info(clean_text)
-            })
+                "had_contact_info": contains_contact_info(clean_text),
+                "header": redact_contact_info(header),
+                "body_length": len(body),
+            }
+
+            posting.update(extract_location_flags(header))
+            rows.append(posting)
 
     return pd.DataFrame(rows)
 
@@ -343,6 +349,34 @@ def report_coverage(postings):
 
     remote_not_onsite = in_window["mentions_remote"] & ~in_window["mentions_onsite"]
     print(f"  remote, not onsite:  {remote_not_onsite.mean():.1%}")
+
+    print("\nLocation coverage, 2016 onward:")
+    print(f"  any location found:  {in_window['location_found'].mean():.1%}")
+    print(f"  US mentioned:        {in_window['mentions_any_us'].mean():.1%}")
+    print(f"  non-US mentioned:    {in_window['mentions_non_us'].mean():.1%}")
+
+    print("\nTransparency-law jurisdictions, 2016 onward:")
+    print(f"  NYC:                 {in_window['mentions_nyc'].mean():.1%}")
+    print(f"  California:          {in_window['mentions_california'].mean():.1%}")
+    print(f"  Washington:          {in_window['mentions_washington'].mean():.1%}")
+    print(f"  Colorado:            {in_window['mentions_colorado'].mean():.1%}")
+
+    print("\nNYC salary disclosure by year (the DiD outcome):")
+    us_only = in_window[in_window["mentions_any_us"] & ~in_window["mentions_non_us"]]
+    for year in sorted(us_only["year"].unique()):
+        year_rows = us_only[us_only["year"] == year]
+        nyc_rows = year_rows[year_rows["mentions_nyc"]]
+        non_nyc_rows = year_rows[~year_rows["mentions_nyc"]]
+
+        if len(nyc_rows) < 30 or len(non_nyc_rows) < 30:
+            continue
+
+        nyc_share = nyc_rows["salary_low"].notna().mean()
+        non_nyc_share = non_nyc_rows["salary_low"].notna().mean()
+
+        print(f"  {year}  NYC {nyc_share:>5.1%} (n={len(nyc_rows):>4,})   "
+              f"non-NYC US {non_nyc_share:>5.1%} (n={len(non_nyc_rows):>4,})   "
+              f"gap {nyc_share - non_nyc_share:>+5.1%}")
 
     print("\nSalary coverage by year:")
     by_year = postings.groupby("year")["salary_low"].agg(["count", "size"])
