@@ -4,3 +4,4 @@ __pycache__/
 .idea/
 .ipynb_checkpoints/
 data/raw/
+data/processed/format_survey.csv

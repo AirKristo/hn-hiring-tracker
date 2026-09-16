@@ -1,6 +1,4 @@
 """
-fetch_threads.py
-
 Finds every monthly "Ask HN: Who is hiring?" thread and saves the list
 to data/processed/threads.csv.
 
