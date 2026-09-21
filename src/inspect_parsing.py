@@ -41,6 +41,19 @@ def main():
         print(f"{row['salary_low']:>10,.0f} - {row['salary_high']:>10,.0f} "
               f"{str(row['salary_currency']):<5} | {row['header'][:110]}")
 
+    print_section("D. Data science vs AI/ML overlap by year")
+    from_2017 = postings[postings["year"] >= 2017]
+    for year in sorted(from_2017["year"].unique()):
+        year_rows = from_2017[from_2017["year"] == year]
+        ai_rows = year_rows[year_rows["role_ai_ml"]]
+        ds_rows = year_rows[year_rows["role_data_science"]]
+
+        ai_also_ds = ai_rows["role_data_science"].mean() if len(ai_rows) > 0 else 0
+        ds_also_ai = ds_rows["role_ai_ml"].mean() if len(ds_rows) > 0 else 0
+
+        print(f"  {year}  AI/ML n={len(ai_rows):>4}  also DS {ai_also_ds:>5.1%}   "
+              f"DS n={len(ds_rows):>4}  also AI/ML {ds_also_ai:>5.1%}")
+
 
 if __name__ == "__main__":
     main()
