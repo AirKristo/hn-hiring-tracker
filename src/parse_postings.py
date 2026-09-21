@@ -23,16 +23,19 @@ Three things learned from inspecting real postings:
   prose. Postings routinely offer both arrangements, so remote and onsite
   are independent flags rather than one categorical.
 
+Location and role extraction live in locations.py and roles.py.
+
 Contact details are redacted before anything is written to data/processed/.
 """
 
 import json
 import os
 import re
-from locations import extract_location_flags
 
 import pandas as pd
 
+from locations import extract_location_flags
+from roles import extract_role_flags
 from text_utils import (
     clean_comment_text,
     contains_contact_info,
@@ -51,32 +54,22 @@ MAXIMUM_PLAUSIBLE_SALARY = 1_000_000
 CURRENCY_SYMBOLS = {"$": "USD", "€": "EUR", "£": "GBP"}
 CURRENCY_CONTEXT_CHARACTERS = 25
 
-# Explicit codes override symbols: "$140k CAD" is Canadian, not US.
 CURRENCY_CODE_PATTERN = re.compile(
     r"\b(USD|CAD|AUD|NZD|EUR|GBP|CHF|SEK|NOK|DKK|INR|SGD|JPY)\b"
 )
 
-# "401k" and "403b" are retirement plans, not pay. They must be removed
-# before any money matching, or 401k parses as a $401,000 salary.
 RETIREMENT_PLAN_PATTERN = re.compile(r"\b40[13]\s*\(?[kb]\)?\b", re.IGNORECASE)
 
-# Equity and funding figures also use currency symbols. "$50M Series B" and
-# "$4M Seed" are not compensation.
 LARGE_MONEY_PATTERN = re.compile(r"[$€£]\s*\d+(?:\.\d+)?\s*[mbMB]\b")
 
-# Monthly and hourly rates are not comparable to annual figures. Skipping
-# them beats converting with an assumed multiplier.
 MONTHLY_RATE_PATTERN = re.compile(r"(?:/|per\s+)\s*(?:month|mo|hour|hr)\b", re.IGNORECASE)
 
-# Matches a written range as one token: "$150k-$200k", "$150-200k",
-# "£100-140k", "$145k — $230k", "160,000 - 220,000".
 SALARY_RANGE_PATTERN = re.compile(
     r"(?P<symbol1>[$€£])?\s*(?P<amount1>\d{1,3}(?:,\d{3})+|\d{2,3})\s*(?P<k1>[kK])?"
     r"\s*(?:-|–|—|to)\s*"
     r"(?P<symbol2>[$€£])?\s*(?P<amount2>\d{1,3}(?:,\d{3})+|\d{2,3})\s*(?P<k2>[kK])?"
 )
 
-# A comma-grouped figure, or a short figure carrying both a symbol and a k.
 SINGLE_SALARY_PATTERN = re.compile(
     r"(?P<symbol>[$€£])?\s*(?P<amount>\d{1,3}(?:,\d{3})+)\s*(?P<k>[kK])?"
     r"|(?P<symbol2>[$€£])\s*(?P<amount2>\d{2,3})\s*(?P<k2>[kK])"
@@ -110,9 +103,7 @@ def detect_currency(matched_text, surrounding_text):
     Determine currency from the matched figure and its immediate context.
 
     An explicit code wins over a symbol, because "$140k CAD" and "$100k AUD"
-    both use a dollar sign for a non-USD currency. We look at a narrow window
-    rather than the whole posting, since a dollar sign elsewhere in the body
-    says nothing about this particular figure.
+    both use a dollar sign for a non-USD currency.
     """
     code_match = CURRENCY_CODE_PATTERN.search(surrounding_text)
 
@@ -158,7 +149,6 @@ def extract_salary_range(searchable, full_text):
     has_symbol = (range_match.group("symbol1") is not None
                   or range_match.group("symbol2") is not None)
 
-    # Require some marker, or a bare "3-5" (years of experience) parses.
     if not has_k1 and not has_k2 and not has_symbol:
         return None
 
@@ -326,6 +316,8 @@ def build_postings(threads):
             }
 
             posting.update(extract_location_flags(header))
+            posting.update(extract_role_flags(header))
+
             rows.append(posting)
 
     return pd.DataFrame(rows)
@@ -340,6 +332,8 @@ def report_coverage(postings):
     print("Field coverage, 2016 onward:")
     print(f"  company:      {in_window['company'].notna().mean():.1%}")
     print(f"  salary:       {in_window['salary_low'].notna().mean():.1%}")
+    print(f"  location:     {in_window['location_found'].mean():.1%}")
+    print(f"  role:         {in_window['role_found'].mean():.1%}")
 
     print("\nWork arrangement, 2016 onward (header only):")
     print(f"  mentions remote:     {in_window['mentions_remote'].mean():.1%}")
@@ -351,44 +345,44 @@ def report_coverage(postings):
     print(f"  remote, not onsite:  {remote_not_onsite.mean():.1%}")
 
     print("\nLocation coverage, 2016 onward:")
-    print(f"  any location found:  {in_window['location_found'].mean():.1%}")
     print(f"  US mentioned:        {in_window['mentions_any_us'].mean():.1%}")
     print(f"  non-US mentioned:    {in_window['mentions_non_us'].mean():.1%}")
-
-    print("\nTransparency-law jurisdictions, 2016 onward:")
     print(f"  NYC:                 {in_window['mentions_nyc'].mean():.1%}")
     print(f"  California:          {in_window['mentions_california'].mean():.1%}")
-    print(f"  Washington:          {in_window['mentions_washington'].mean():.1%}")
-    print(f"  Colorado:            {in_window['mentions_colorado'].mean():.1%}")
 
-    print("\nNYC salary disclosure by year (the DiD outcome):")
-    us_only = in_window[in_window["mentions_any_us"] & ~in_window["mentions_non_us"]]
-    for year in sorted(us_only["year"].unique()):
-        year_rows = us_only[us_only["year"] == year]
-        nyc_rows = year_rows[year_rows["mentions_nyc"]]
-        non_nyc_rows = year_rows[~year_rows["mentions_nyc"]]
+    print("\nRole share by year (share of postings mentioning each family):")
+    role_columns = [
+        "role_ai_ml", "role_data_science", "role_data_engineering",
+        "role_data_analyst", "role_software_engineer", "role_infrastructure",
+        "role_security", "role_mobile", "role_product", "role_design",
+    ]
 
-        if len(nyc_rows) < 30 or len(non_nyc_rows) < 30:
-            continue
+    header_labels = "  year  " + " ".join(
+        name.replace("role_", "")[:8].rjust(8) for name in role_columns
+    )
+    print(header_labels)
 
-        nyc_share = nyc_rows["salary_low"].notna().mean()
-        non_nyc_share = non_nyc_rows["salary_low"].notna().mean()
+    for year in sorted(in_window["year"].unique()):
+        year_rows = in_window[in_window["year"] == year]
+        shares = []
 
-        print(f"  {year}  NYC {nyc_share:>5.1%} (n={len(nyc_rows):>4,})   "
-              f"non-NYC US {non_nyc_share:>5.1%} (n={len(non_nyc_rows):>4,})   "
-              f"gap {nyc_share - non_nyc_share:>+5.1%}")
+        for column in role_columns:
+            shares.append(f"{year_rows[column].mean():>7.1%} ")
+
+        print(f"  {year} " + " ".join(shares))
+
+    print("\nSeniority share by year:")
+    for year in sorted(in_window["year"].unique()):
+        year_rows = in_window[in_window["year"] == year]
+        print(f"  {year}  senior {year_rows['seniority_senior'].mean():>5.1%}   "
+              f"junior {year_rows['seniority_junior'].mean():>5.1%}   "
+              f"founding {year_rows['seniority_founding'].mean():>5.1%}")
 
     print("\nSalary coverage by year:")
     by_year = postings.groupby("year")["salary_low"].agg(["count", "size"])
     for year, row in by_year.iterrows():
         share = row["count"] / row["size"]
         print(f"  {year}  {share:>5.1%}  (n={row['size']:,})")
-
-    print("\nCurrency mix of extracted salaries, 2016 onward:")
-    with_salary = in_window[in_window["salary_low"].notna()]
-    currency_counts = with_salary["salary_currency"].value_counts(dropna=False)
-    for currency, count in currency_counts.head(8).items():
-        print(f"  {str(currency):<6} {count:>6,}  ({count / len(with_salary):>5.1%})")
 
     print("\nExtracted salary distribution (USD only, 2016 onward):")
     usd_salaries = in_window[in_window["salary_currency"] == "USD"]["salary_low"]
